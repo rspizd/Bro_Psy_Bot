@@ -1,0 +1,402 @@
+import asyncio
+from html import escape
+import json
+import logging
+import os
+import re
+import tempfile
+import unicodedata
+from collections.abc import Iterable
+from pathlib import Path
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from aiohttp import web
+from openai import APIError, AsyncOpenAI
+
+logger = logging.getLogger(__name__)
+
+API_BASE_URL = "https://api.proxyapi.ru/v1"
+MODEL_NAME = "deepseek/deepseek-chat"
+MAX_TELEGRAM_MESSAGE_LENGTH = 4000
+MAX_HISTORY_MESSAGES = 10
+ROLE_STORE_PATH = Path(__file__).resolve().parents[2] / "roles.json"
+SYSTEM_PROMPT = (
+    "Ты — Бро, психолог-коуч 18+. Ты говоришь жёстко, прямо, с матом. "
+    "Твоя цель — вытащить пользователя из самообмана. Не ставь диагнозы, "
+    "не назначай таблетки. Если тема суицида или самоповреждения — выключай мат, "
+    "говори серьёзно и советуй позвонить 112. В конце каждого ответа спрашивай: "
+    "'Что ты готов сделать сегодня?'"
+)
+WELCOME_MESSAGE = (
+    "Привет. Я твой Бро. Психолог с матом и без соплей. "
+    "Скажи, кто ты, чтобы я знал, как с тобой говорить."
+)
+ROLE_SYSTEM_PROMPTS = {
+    "male": (
+        "Ты — Брачо. Говори жёстко, прямо, с матом, как друг-мужик. "
+        "Твоя цель — вытащить из самообмана и дать пинка. Не жалей."
+    ),
+    "female": (
+        "Ты — Брачо. Говори честно, с пониманием женской специфики, "
+        "про границы и самоценность. Но без сюсюканья, с матом если надо."
+    ),
+    "parent": (
+        "Ты — Брачо. Говори с пониманием родительской усталости, без осуждения. "
+        "Поддерживай и давай конкретные шаги."
+    ),
+}
+ROLE_CALLBACKS = {
+    "role_male": "male",
+    "role_female": "female",
+    "role_parent": "parent",
+}
+VALID_ROLES = frozenset(ROLE_SYSTEM_PROMPTS)
+SAFETY_REPLY = (
+    "Отвечу серьёзно: если ты или кто-то рядом может пострадать прямо сейчас, "
+    "немедленно позвони 112. Перейди в безопасное место и попроси человека, "
+    "которому доверяешь, побыть рядом."
+)
+SAFETY_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\b(?:suicid\w*|self[\s-]?harm\w*|self[\s-]?injur\w*|"
+        r"kill\s+myself|end\s+my\s+life|end\s+it\s+all|take\s+my\s+own\s+life|"
+        r"(?:want|wanna)\s+to\s+die|hurt\s+myself|cut\s+myself|harm\s+myself)\b",
+        r"\b(?:violence|violent|abuse|assault|rape|murder|attack|stab|shoot|bomb)\w*\b",
+        r"\b(?:kill|hurt|harm|shoot|stab)\w*\s+"
+        r"(?:me|you|him|her|them|someone|somebody|myself|yourself|himself|herself)\b",
+        r"\b(?:суицид\w*|самоубийств\w*|самоповрежд\w*|"
+        r"покончить\s+с\s+собой|свести\s+счеты\s+с\s+жизнью|"
+        r"хочу\s+умереть|не\s+хочу\s+жить|умереть\s+хочу|"
+        r"убить\s+себя|порезать\s+себя|вскрыть\s+вены|"
+        r"причинить\s+себе\s+вред|нанести\s+себе\s+вред)\b",
+        r"\b(?:насили\w*|жесток\w*|изнасил\w*|убийств\w*|напад\w*|"
+        r"изби\w*|драк\w*|ударить|ударил\w*|ударю|побить|побил\w*|"
+        r"застрел\w*|пристрел\w*|взорвать|взорвал\w*|пырнуть|пырнул\w*|"
+        r"убить|убью|убей|убивал\w*|убиваю)\b",
+        r"\b(?:хочу|собираюсь|планирую)\s+убить\b",
+    )
+)
+
+
+def is_safety_related(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", text).casefold().replace("ё", "е")
+    return any(pattern.search(normalized) for pattern in SAFETY_PATTERNS)
+
+
+async def health_handler(_: web.Request) -> web.Response:
+    return web.json_response({"status": "ok"})
+
+
+def make_role_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Мужик", callback_data="role_male"),
+                InlineKeyboardButton(text="Женщина", callback_data="role_female"),
+                InlineKeyboardButton(text="Родитель", callback_data="role_parent"),
+            ]
+        ]
+    )
+
+
+async def send_onboarding(message: Message) -> None:
+    await message.answer(WELCOME_MESSAGE, reply_markup=make_role_keyboard())
+
+
+def load_user_roles(path: Path = ROLE_STORE_PATH) -> dict[int, str]:
+    try:
+        with path.open(encoding="utf-8") as role_file:
+            saved_roles = json.load(role_file)
+    except FileNotFoundError:
+        return {}
+
+    if not isinstance(saved_roles, dict):
+        raise ValueError(f"{path} must contain a JSON object of user IDs and roles.")
+
+    user_roles: dict[int, str] = {}
+    for saved_user_id, role in saved_roles.items():
+        try:
+            user_id = int(saved_user_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{path} contains an invalid user ID.") from exc
+        if user_id <= 0 or not isinstance(role, str) or role not in VALID_ROLES:
+            raise ValueError(f"{path} contains an invalid role entry.")
+        user_roles[user_id] = role
+    return user_roles
+
+
+def save_user_roles(user_roles: dict[int, str], path: Path = ROLE_STORE_PATH) -> None:
+    for role in user_roles.values():
+        if not isinstance(role, str) or role not in VALID_ROLES:
+            raise ValueError("Cannot save an unknown user role.")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as role_file:
+            temporary_path = Path(role_file.name)
+            json.dump(
+                {str(user_id): role for user_id, role in sorted(user_roles.items())},
+                role_file,
+                ensure_ascii=False,
+                indent=2,
+            )
+            role_file.write("\n")
+            role_file.flush()
+            os.fsync(role_file.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+async def handle_role_selection(
+    callback: CallbackQuery,
+    user_roles: dict[int, str],
+    role_store_path: Path = ROLE_STORE_PATH,
+) -> None:
+    role = ROLE_CALLBACKS.get(callback.data or "")
+    if role is None:
+        await callback.answer("Не удалось распознать выбор.", show_alert=True)
+        return
+
+    updated_roles = {**user_roles, callback.from_user.id: role}
+    try:
+        save_user_roles(updated_roles, role_store_path)
+    except (OSError, ValueError):
+        logger.exception("Failed to save selected user role")
+        await callback.answer(
+            "Не удалось сохранить выбор. Попробуй ещё раз.", show_alert=True
+        )
+        return
+
+    user_roles[callback.from_user.id] = role
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text("Принял. Погнали.", reply_markup=None)
+
+
+class SecretRedactionFilter(logging.Filter):
+    def __init__(self, secrets: Iterable[str]) -> None:
+        super().__init__()
+        self.secrets = tuple(secret for secret in secrets if secret)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        for secret in self.secrets:
+            message = message.replace(secret, "[REDACTED]")
+        record.msg = message
+        record.args = ()
+        if record.exc_info:
+            exception_text = logging.Formatter().formatException(record.exc_info)
+            for secret in self.secrets:
+                exception_text = exception_text.replace(secret, "[REDACTED]")
+            record.exc_text = exception_text
+            record.exc_info = None
+        if record.stack_info:
+            for secret in self.secrets:
+                record.stack_info = record.stack_info.replace(secret, "[REDACTED]")
+        return True
+
+
+async def send_reply(message: Message, text: str) -> None:
+    remaining = text
+    while remaining:
+        end = min(len(remaining), MAX_TELEGRAM_MESSAGE_LENGTH)
+        if end < len(remaining):
+            newline = remaining.rfind("\n", 0, end)
+            if newline >= end // 2:
+                end = newline
+
+        chunk = remaining[:end]
+        formatted_chunk = markdown_to_telegram_html(chunk)
+        while len(formatted_chunk) > MAX_TELEGRAM_MESSAGE_LENGTH and end > 1:
+            end = max(1, end * MAX_TELEGRAM_MESSAGE_LENGTH // len(formatted_chunk) - 1)
+            chunk = remaining[:end]
+            formatted_chunk = markdown_to_telegram_html(chunk)
+
+        await message.answer(formatted_chunk)
+        remaining = remaining[end:].lstrip("\n")
+
+
+def markdown_to_telegram_html(text: str) -> str:
+    protected_markup: list[str] = []
+
+    def protect_code(match: re.Match[str], tag: str) -> str:
+        token = f"\x00TG_MARKUP_{len(protected_markup)}\x00"
+        code = escape(match.group(1), quote=False)
+        if tag == "pre":
+            protected_markup.append(f"<pre>{code}</pre>")
+        else:
+            protected_markup.append(f"<code>{code}</code>")
+        return token
+
+    text = re.sub(
+        r"```[^\n]*\n(.*?)```",
+        lambda match: protect_code(match, "pre"),
+        text,
+        flags=re.DOTALL,
+    )
+    text = re.sub(
+        r"`([^`\n]+)`",
+        lambda match: protect_code(match, "code"),
+        text,
+    )
+
+    formatted = escape(text, quote=False)
+    formatted = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", formatted)
+    formatted = re.sub(r"__(.+?)__", r"<b>\1</b>", formatted)
+    formatted = re.sub(
+        r"(?m)^ {0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$",
+        lambda match: (
+            match.group(1)
+            if match.group(1).startswith("<b>") and match.group(1).endswith("</b>")
+            else f"<b>{match.group(1)}</b>"
+        ),
+        formatted,
+    )
+    formatted = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", formatted)
+    formatted = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"<i>\1</i>", formatted)
+    formatted = re.sub(r"(?m)^([ \t]*)[-+*][ \t]+", r"\1• ", formatted)
+
+    for index, markup in enumerate(protected_markup):
+        formatted = formatted.replace(f"\x00TG_MARKUP_{index}\x00", markup)
+    return formatted
+
+
+async def handle_user_message(
+    message: Message,
+    client: AsyncOpenAI,
+    conversation_memory: dict[int, list[dict[str, str]]],
+    user_locks: dict[int, asyncio.Lock],
+    user_roles: dict[int, str],
+) -> None:
+    user_text = message.text or ""
+    if not user_text:
+        return
+    if user_text.lstrip().startswith("/"):
+        return
+
+    if is_safety_related(user_text):
+        await message.answer(SAFETY_REPLY)
+        return
+
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    if user_id not in user_roles:
+        await message.answer("Сначала отправь /start и выбери роль.")
+        return
+
+    user_lock = user_locks.setdefault(user_id, asyncio.Lock())
+
+    async with user_lock:
+        request_history = [
+            *conversation_memory.get(user_id, []),
+            {"role": "user", "content": user_text},
+        ][-MAX_HISTORY_MESSAGES:]
+
+        try:
+            completion = await client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": ROLE_SYSTEM_PROMPTS.get(
+                            user_roles.get(user_id, ""), SYSTEM_PROMPT
+                        ),
+                    },
+                    *request_history,
+                ],
+            )
+        except APIError:
+            logger.exception("ProxyAPI request failed")
+            await message.answer("Не получилось получить ответ. Попробуй ещё раз позже.")
+            return
+
+        answer = completion.choices[0].message.content
+        if not answer or not answer.strip():
+            await message.answer("Не получилось получить ответ. Попробуй ещё раз позже.")
+            return
+
+        answer = answer.strip()
+        conversation_memory[user_id] = [
+            *request_history,
+            {"role": "assistant", "content": answer},
+        ][-MAX_HISTORY_MESSAGES:]
+        await send_reply(message, answer)
+
+
+async def run_bot(telegram_token: str, proxyapi_key: str) -> None:
+    user_roles = load_user_roles()
+    logger.info("Loaded %d saved user roles", len(user_roles))
+
+    bot = Bot(
+        token=telegram_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    client = AsyncOpenAI(api_key=proxyapi_key, base_url=API_BASE_URL)
+    dispatcher = Dispatcher()
+    conversation_memory: dict[int, list[dict[str, str]]] = {}
+    user_locks: dict[int, asyncio.Lock] = {}
+    health_app = web.Application()
+    health_app.router.add_get("/", health_handler)
+    health_app.router.add_get("/health", health_handler)
+    health_runner = web.AppRunner(health_app)
+
+    @dispatcher.message(CommandStart())
+    async def handle_start(message: Message) -> None:
+        await send_onboarding(message)
+
+    @dispatcher.callback_query(F.data.in_(ROLE_CALLBACKS))
+    async def handle_role_callback(callback: CallbackQuery) -> None:
+        await handle_role_selection(callback, user_roles, ROLE_STORE_PATH)
+
+    @dispatcher.message(F.text & ~F.text.startswith("/"))
+    async def handle_message(message: Message) -> None:
+        await handle_user_message(
+            message, client, conversation_memory, user_locks, user_roles
+        )
+
+    try:
+        await health_runner.setup()
+        health_port = int(os.getenv("BOT_HEALTH_PORT", "8099"))
+        health_site = web.TCPSite(health_runner, host="0.0.0.0", port=health_port)
+        await health_site.start()
+        logger.info("Health server listening on port %s", health_port)
+        await dispatcher.start_polling(bot)
+    finally:
+        await health_runner.cleanup()
+        await bot.session.close()
+        await client.close()
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    proxyapi_key = os.getenv("PROXYAPI_KEY")
+    if not telegram_token:
+        raise SystemExit("Missing required TELEGRAM_BOT_TOKEN environment secret.")
+    if not proxyapi_key:
+        raise SystemExit("Missing required PROXYAPI_KEY environment secret.")
+
+    redaction_filter = SecretRedactionFilter((telegram_token, proxyapi_key))
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(redaction_filter)
+
+    asyncio.run(run_bot(telegram_token, proxyapi_key))
